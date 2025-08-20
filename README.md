@@ -33,13 +33,15 @@ O projeto mostra como distribuir requests entre múltiplos servidores de forma e
 
 ---
 
+![Diagrama do Sistema](images/diagrama.png)
+
+
 ## Como Iniciar
 
 1. Faça um fork do repositório e clone localmente:
 ```bash
 git clone https://github.com/IgorBrizack/consistent-hashing-system-design.git
 cd consistent-hashing-system-design
-
 
 O serviço estará disponível em: http://localhost:80
 
@@ -49,3 +51,18 @@ O serviço estará disponível em: http://localhost:80
 | GET    | /kv?key=  | Busca o valor de uma chave (gera se não existir) |
 | POST   | /kv       | Sobrescreve o valor de uma chave (JSON: {"key":"foo","value":"bar"}) |
 | GET    | /whoami   | Retorna o servidor atendendo a requisição |
+
+```
+2. Este repositório possui um Makefile para testes básicos:
+
+```bash
+make test
+```
+
+O comando executa:
+
+- Healthcheck do serviço.
+- Testes de criação e leitura de chaves.
+- Testes de cache hit/miss.
+- Testes multi-tenant para consistent hashing.
+
