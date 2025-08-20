@@ -9,8 +9,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -30,19 +32,27 @@ type ttlCache struct {
 	ttl  time.Duration
 }
 
-func newTTLCache(ttl time.Duration) *ttlCache {
+func newTTLCache(ctx context.Context, ttl time.Duration) *ttlCache {
 	c := &ttlCache{data: make(map[string]item), ttl: ttl}
-	// limpeza periódica
+
+	// limpeza periódica controlada por contexto
 	go func() {
 		t := time.NewTicker(ttl)
-		for range t.C {
-			c.mu.Lock()
-			for k, it := range c.data {
-				if time.Now().After(it.expires) {
-					delete(c.data, k)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				now := time.Now()
+				c.mu.Lock()
+				for k, it := range c.data {
+					if now.After(it.expires) {
+						delete(c.data, k)
+					}
 				}
+				c.mu.Unlock()
+			case <-ctx.Done():
+				return
 			}
-			c.mu.Unlock()
 		}
 	}()
 	return c
@@ -87,25 +97,42 @@ func sha1Hex(b []byte) string {
 }
 
 func main() {
-	ctx := context.Background()
+	// contexto raiz + shutdown gracioso
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// captura de sinais para shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
 	port := getenv("APP_PORT", "8080")
 
-	// Redis
+	// Redis Options + tunings
 	opt, err := redis.ParseURL(getenv("REDIS_URL", "redis://localhost:6379/0"))
 	if err != nil {
 		log.Fatal(err)
 	}
+	// tunings recomendados (ajuste conforme o tráfego)
+	opt.MaxRetries = 2
+	opt.DialTimeout = 500 * time.Millisecond
+	opt.ReadTimeout = 300 * time.Millisecond
+	opt.WriteTimeout = 300 * time.Millisecond
+	opt.PoolSize = 50
+	opt.MinIdleConns = 10
+	opt.PoolTimeout = 500 * time.Millisecond
+
 	rdb := redis.NewClient(opt)
 
 	// Local cache (por nó). Afinidade do NGINX ajuda o hit-rate.
-	local := newTTLCache(30 * time.Second)
+	local := newTTLCache(rootCtx, 30*time.Second)
 
 	r := chi.NewRouter()
 
 	// health
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(200)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 
 	// GET /kv?key=foo -> retorna valor; se não existir, gera e persiste
@@ -126,31 +153,42 @@ func main() {
 
 		// 1) tenta cache local
 		if v, ok := local.Get(nsKey); ok {
-			w.Write(v)
+			// deixa content-type por conta do cliente/uso; se preferir, use octet-stream:
+			// w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(v)
 			return
 		}
 
-		// 2) tenta Redis
-		v, err := rdb.Get(ctx, nsKey).Bytes()
+		// 2) tenta Redis (com timeout por operação)
+		opCtx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
+		v, err := rdb.Get(opCtx, nsKey).Bytes()
+		cancel()
 		if err == nil {
 			local.Set(nsKey, v)
-			w.Write(v)
+			_, _ = w.Write(v)
 			return
 		}
+		if err != redis.Nil { // erro real (não apenas key inexistente)
+			log.Printf("warn: redis GET key=%s err=%v", nsKey, err)
+		}
 
-		// 3) simula DB: só gera um valor determinístico
+		// 3) simula DB: gera valor determinístico
 		val := []byte("val-" + sha1Hex([]byte(nsKey)))
 
-		// grava em Redis e local
-		_ = rdb.Set(ctx, nsKey, val, 2*time.Minute).Err()
+		// grava em Redis (com timeout) e local
+		opCtx, cancel = context.WithTimeout(r.Context(), 200*time.Millisecond)
+		if setErr := rdb.Set(opCtx, nsKey, val, 2*time.Minute).Err(); setErr != nil {
+			log.Printf("warn: redis SET key=%s err=%v", nsKey, setErr)
+		}
+		cancel()
 		local.Set(nsKey, val)
 
-		w.Write(val)
+		_, _ = w.Write(val)
 	})
+
 	// POST /kv body: key=foo&val=bar -> seta valor
 	r.Post("/kv", func(w http.ResponseWriter, r *http.Request) {
-		err := r.ParseForm()
-		if err != nil {
+		if err := r.ParseForm(); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
@@ -168,24 +206,59 @@ func main() {
 		}
 
 		nsKey := namespacedKey(tenant, key)
-		_ = rdb.Set(ctx, nsKey, val, 10*time.Minute).Err()
+
+		opCtx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
+		if setErr := rdb.Set(opCtx, nsKey, val, 10*time.Minute).Err(); setErr != nil {
+			log.Printf("warn: redis SET key=%s err=%v", nsKey, setErr)
+		}
+		cancel()
 		local.Set(nsKey, []byte(val))
 		w.WriteHeader(204)
 	})
 
 	// debug: mostra qual pod atendeu
 	r.Get("/whoami", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		id := getenv("HOSTNAME", "unknown")
-		fmt.Fprintf(w, "server=%s\n", id)
+		_, _ = fmt.Fprintf(w, "server=%s\n", id)
 	})
 
-	log.Printf("listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, withDefaultHeaders(r)))
+	// middleware: apenas headers padrão que não conflitam com handlers
+	handler := withDefaultHeaders(r)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           handler,
+		ReadHeaderTimeout: 2 * time.Second,
+	}
+
+	go func() {
+		log.Printf("listening on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	// aguarda sinal e encerra
+	select {
+	case sig := <-sigCh:
+		log.Printf("shutdown requested: %s", sig)
+	case <-rootCtx.Done():
+	}
+
+	// shutdown gracioso do HTTP e cancel do rootCtx (encerra cleaner do cache)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("server shutdown error: %v", err)
+	}
+	cancel() // encerra goroutines ligadas ao rootCtx
+	log.Println("bye")
 }
 
 func withDefaultHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		// Não força Content-Type aqui; cada handler define o seu.
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
