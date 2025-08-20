@@ -36,10 +36,10 @@ O projeto mostra como distribuir requests entre múltiplos servidores de forma e
 ## Como Iniciar
 
 1. Faça um fork do repositório e clone localmente:
-````bash
+```bash
 git clone https://github.com/IgorBrizack/consistent-hashing-system-design.git
 cd consistent-hashing-system-design
-´´´
+
 
 O serviço estará disponível em: http://localhost:80
 
